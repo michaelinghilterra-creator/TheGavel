@@ -27,6 +27,49 @@ def test_loads_demo_fixture() -> None:
     assert rubric.dimensions[1].cap_to == 2.5
 
 
+def test_valid_choice_field_loads() -> None:
+    data = base_data()
+    data["fields"] = [
+        {
+            "key": "ceiling",
+            "type": "choice",
+            "choices": ["none", "two"],
+            "meaning": "Score ceiling.",
+            "after": True,
+        }
+    ]
+    field = rubric_from_dict(data).fields[0]
+    assert field.type == "choice"
+    assert field.choices == ("none", "two")
+    assert field.meaning == "Score ceiling."
+    assert field.after is True
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"key": "bad_type", "type": "number"},
+        {"key": "unhashable_type", "type": []},
+        {"key": "missing_choices", "type": "choice"},
+        {"key": "not_a_list", "type": "choice", "choices": ("A",)},
+        {"key": "duplicate", "type": "choice", "choices": ["A", "A"]},
+        {"key": "empty", "type": "choice", "choices": [""]},
+        {"key": "space", "type": "choice", "choices": ["A B"]},
+        {"key": "quote", "type": "choice", "choices": ['A"B']},
+        {"key": "not_string", "type": "choice", "choices": [1]},
+        {"key": "text_choices", "choices": ["A"]},
+        {"key": "null_choices", "choices": None},
+        {"key": "bad_after", "after": 1},
+        {"key": "bad_meaning", "meaning": 1},
+    ],
+)
+def test_invalid_field_configuration_names_field_key(field: dict) -> None:
+    data = base_data()
+    data["fields"] = [field]
+    with pytest.raises(ValueError, match=field["key"]):
+        rubric_from_dict(data)
+
+
 def test_labels() -> None:
     assert Dimension("stars", "Stars", 1, 3).labels() == ["1", "2", "3"]
 

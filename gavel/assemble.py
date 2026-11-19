@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from .readout import Readout
+from .readout import ChoiceReadout, Readout
 from .rubric import Rubric
 
 
@@ -38,11 +38,26 @@ def _ratings_start(
     return f'{{"fields":{{{_fields_text(fields)}}},"ratings":{{{rating_items}'
 
 
-def field_prefix(done: dict[str, str], key: str) -> str:
-    """Build a prefix ready for a free text field value."""
+def field_prefix(
+    done: dict[str, str],
+    key: str,
+    *,
+    ratings: dict[str, int] | None = None,
+    evidence: dict[str, str] | None = None,
+    after_done: dict[str, str] | None = None,
+) -> str:
+    """Build a prefix ready for a field value."""
 
-    separator = "," if done else ""
-    return f'{{"fields":{{{_fields_text(done)}{separator}{json_str(key)}:"'
+    if ratings is None:
+        separator = "," if done else ""
+        return f'{{"fields":{{{_fields_text(done)}{separator}{json_str(key)}:"'
+
+    completed_after = after_done or {}
+    separator = "," if completed_after else ""
+    return (
+        f'{_ratings_start(done, ratings, evidence)}}},"after":{{'
+        f'{_fields_text(completed_after)}{separator}{json_str(key)}:"'
+    )
 
 
 def rating_prefix(
@@ -82,6 +97,7 @@ def final_json(
     readouts: dict[str, Readout],
     evidence: dict[str, str] | None,
     score: dict,
+    choices: dict[str, ChoiceReadout] | None = None,
 ) -> dict:
     """Assemble the completed evaluation as a plain dictionary."""
 
@@ -107,11 +123,27 @@ def final_json(
         if numeric_score is not None and rubric.threshold is not None
         else None
     )
-    return {
+    result = {
         "rubric": rubric.name,
-        "fields": dict(fields),
+        "fields": {
+            field.key: fields[field.key]
+            for field in rubric.fields
+            if field.key in fields
+        },
         "ratings": ratings,
         "score": numeric_score,
         "capped_by": list(score["capped_by"]),
         "pass": passed,
     }
+    if any(field.type == "choice" for field in rubric.fields):
+        choice_results = choices or {}
+        result["choices"] = {
+            field.key: {
+                "value": choice_results[field.key].value,
+                "mass": choice_results[field.key].mass,
+                "probs": dict(choice_results[field.key].probs),
+            }
+            for field in rubric.fields
+            if field.type == "choice" and field.key in choice_results
+        }
+    return result

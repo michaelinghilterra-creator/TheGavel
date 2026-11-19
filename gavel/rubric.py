@@ -34,10 +34,14 @@ class Dimension:
 
 @dataclass(frozen=True)
 class Field:
-    """A free text field produced during evaluation."""
+    """A field produced during evaluation."""
 
     key: str
     max_tokens: int = 60
+    type: str = "text"
+    choices: tuple[str, ...] = ()
+    meaning: str | None = None
+    after: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,48 @@ def _dimension_from_dict(item: dict[str, Any]) -> Dimension:
     )
 
 
+def _field_from_dict(item: dict[str, Any]) -> Field:
+    key = item.get("key")
+    _validate_key(key)
+    field_type = item.get("type", "text")
+    choices = item.get("choices", [])
+    meaning = item.get("meaning")
+    after = item.get("after", False)
+
+    if not isinstance(field_type, str) or field_type not in {"text", "choice"}:
+        raise ValueError(f"field {key!r} has invalid type")
+    if not isinstance(choices, list):
+        raise ValueError(f"field {key!r} has invalid choices")
+    if field_type == "choice":
+        if (
+            not choices
+            or any(
+                not isinstance(choice, str)
+                or not choice
+                or any(character.isspace() for character in choice)
+                or '"' in choice
+                for choice in choices
+            )
+            or len(set(choices)) != len(choices)
+        ):
+            raise ValueError(f"field {key!r} has invalid choices")
+    elif choices:
+        raise ValueError(f"field {key!r} is text and must not have choices")
+    if not isinstance(after, bool):
+        raise ValueError(f"field {key!r} after must be a bool")
+    if meaning is not None and not isinstance(meaning, str):
+        raise ValueError(f"field {key!r} meaning must be a string")
+
+    return Field(
+        key=key,
+        max_tokens=item.get("max_tokens", 60),
+        type=field_type,
+        choices=tuple(choices),
+        meaning=meaning,
+        after=after,
+    )
+
+
 def rubric_from_dict(
     d: dict[str, Any], base_dir: str | os.PathLike[str] = "."
 ) -> Rubric:
@@ -115,10 +161,7 @@ def rubric_from_dict(
         raise ValueError("rubric requires at least one dimension")
 
     dimensions = tuple(_dimension_from_dict(item) for item in dimension_items)
-    fields = tuple(
-        Field(key=item.get("key"), max_tokens=item.get("max_tokens", 60))
-        for item in d.get("fields", [])
-    )
+    fields = tuple(_field_from_dict(item) for item in d.get("fields", []))
 
     seen: set[str] = set()
     for entry in (*dimensions, *fields):

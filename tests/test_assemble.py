@@ -6,7 +6,7 @@ from gavel.assemble import (
     final_json,
     rating_prefix,
 )
-from gavel.readout import Readout
+from gavel.readout import ChoiceReadout, Readout
 from gavel.rubric import Dimension, Field, Rubric
 
 
@@ -15,6 +15,24 @@ def test_first_field_prefix() -> None:
 
 
 def test_second_field_prefix() -> None:
+    assert field_prefix({"first": "done"}, "second") == (
+        '{"fields":{"first":"done","second":"'
+    )
+
+
+def test_after_field_prefix() -> None:
+    assert field_prefix(
+        {"summary": "Fine"},
+        "limit",
+        ratings={"clarity": 4},
+        after_done={"category": "A"},
+    ) == (
+        '{"fields":{"summary":"Fine"},"ratings":{"clarity":4},'
+        '"after":{"category":"A","limit":"'
+    )
+
+
+def test_no_after_field_prefix_is_unchanged_exactly() -> None:
     assert field_prefix({"first": "done"}, "second") == (
         '{"fields":{"first":"done","second":"'
     )
@@ -113,3 +131,34 @@ def test_final_json_fail_and_none_pass_logic() -> None:
     assert failed["pass"] is False
     assert no_score["pass"] is None
     assert no_threshold["pass"] is None
+
+
+def test_final_json_includes_choice_metadata_and_rubric_field_order() -> None:
+    rubric = Rubric(
+        "choice",
+        "Judge it.",
+        (Dimension("quality", "Quality"),),
+        (
+            Field("before"),
+            Field("band", type="choice", choices=("A", "B"), after=True),
+        ),
+    )
+    result = final_json(
+        rubric,
+        {"band": "A", "before": "Fine"},
+        {},
+        None,
+        {"score": None, "capped_by": []},
+        choices={"band": ChoiceReadout("A", 0.8, {"A": 0.75, "B": 0.25})},
+    )
+    assert list(result["fields"]) == ["before", "band"]
+    assert result["choices"] == {
+        "band": {"value": "A", "mass": 0.8, "probs": {"A": 0.75, "B": 0.25}}
+    }
+
+
+def test_final_json_without_choice_field_has_no_choices_key() -> None:
+    result = final_json(
+        sample_rubric(), {}, {}, None, {"score": None, "capped_by": []}
+    )
+    assert "choices" not in result

@@ -19,6 +19,15 @@ class Readout:
     probs: dict[int, float]
 
 
+@dataclass(frozen=True)
+class ChoiceReadout:
+    """Statistics for a choice label distribution."""
+
+    value: str
+    mass: float
+    probs: dict[str, float]
+
+
 def read_distribution(
     top_logprobs: list[dict], dim: Dimension
 ) -> Readout | None:
@@ -42,3 +51,23 @@ def read_distribution(
     )
     argmax = max(probs, key=lambda value: (probs[value], -value))
     return Readout(ev=ev, argmax=argmax, sd=math.sqrt(variance), mass=mass, probs=probs)
+
+
+def read_choice(
+    top_logprobs: list[dict], choices: tuple[str, ...]
+) -> ChoiceReadout | None:
+    """Read a normalized distribution over choice labels."""
+
+    raw = {choice: 0.0 for choice in choices}
+    for item in top_logprobs:
+        token = item["token"].strip()
+        if token in raw:
+            raw[token] += math.exp(item["logprob"])
+
+    mass = sum(raw.values())
+    if mass == 0.0:
+        return None
+
+    probs = {choice: probability / mass for choice, probability in raw.items()}
+    value = max(choices, key=lambda choice: probs[choice])
+    return ChoiceReadout(value=value, mass=mass, probs=probs)

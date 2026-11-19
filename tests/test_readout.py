@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from gavel.readout import read_distribution
+from gavel.readout import read_choice, read_distribution
 from gavel.rubric import Dimension
 
 
@@ -90,3 +90,36 @@ def test_one_to_three_scale() -> None:
     assert set(result.probs) == {1, 2, 3}
     assert result.ev == pytest.approx(7 / 3)
     assert result.mass == pytest.approx(0.6)
+
+
+def test_choice_merges_tokens_renormalizes_and_ignores_other_tokens() -> None:
+    result = read_choice(
+        [
+            {"token": " A", "logprob": math.log(0.2)},
+            {"token": "A", "logprob": math.log(0.1)},
+            {"token": "B", "logprob": math.log(0.3)},
+            {"token": "other", "logprob": math.log(0.4)},
+        ],
+        ("A", "B", "C"),
+    )
+    assert result is not None
+    assert result.value == "A"
+    assert result.mass == pytest.approx(0.6)
+    assert list(result.probs) == ["A", "B", "C"]
+    assert result.probs == pytest.approx({"A": 0.5, "B": 0.5, "C": 0.0})
+
+
+def test_choice_tie_uses_first_choice() -> None:
+    result = read_choice(
+        [
+            {"token": "second", "logprob": math.log(0.5)},
+            {"token": "first", "logprob": math.log(0.5)},
+        ],
+        ("first", "second"),
+    )
+    assert result is not None
+    assert result.value == "first"
+
+
+def test_choice_with_no_mass_returns_none() -> None:
+    assert read_choice([{"token": "x", "logprob": 0.0}], ("A", "B")) is None
