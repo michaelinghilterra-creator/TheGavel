@@ -21,10 +21,54 @@ class JudgeStats:
     low_mass: int = 0
 
 
-def build_user_message(rubric: Rubric, text: str) -> str:
+def format_section(rubric: Rubric, mode: str = "lean") -> str:
+    """Describe the exact output layout and rating scale for a rubric."""
+
+    fields = ",".join(
+        f'"{field.key}":"<text, under {field.max_tokens} tokens>"'
+        for field in rubric.fields
+    )
+    if mode == "explain":
+        ratings = ",".join(
+            f'"{dimension.key}":{{"evidence":"<one short sentence>",'
+            f'"val":<integer {dimension.min} to {dimension.max}>}}'
+            for dimension in rubric.dimensions
+        )
+    else:
+        ratings = ",".join(
+            f'"{dimension.key}":<integer {dimension.min} to {dimension.max}>'
+            for dimension in rubric.dimensions
+        )
+    lines = [
+        "# Output format",
+        "",
+        "Your reply is one JSON object written by the scoring engine:",
+        f'{{"fields":{{{fields}}},"ratings":{{{ratings}}}}}',
+        "",
+        "Each rating is a single digit. Meaning of each rating:",
+        *(
+            f"- {dimension.key} ({dimension.label}): "
+            f"{dimension.min} = worst, {dimension.max} = best"
+            for dimension in rubric.dimensions
+        ),
+    ]
+    if rubric.fields:
+        lines.extend(
+            ["", "Write each text field as plain prose with no quote characters."]
+        )
+    return "\n".join(lines)
+
+
+def build_user_message(rubric: Rubric, text: str, mode: str = "lean") -> str:
     """Build the cache-friendly user message for an item."""
 
-    return rubric.preamble + "\n\n---\n\n# Item to score\n\n" + text
+    return (
+        rubric.preamble
+        + "\n\n"
+        + format_section(rubric, mode)
+        + "\n\n---\n\n# Item to score\n\n"
+        + text
+    )
 
 
 def _clean_generated(value: str) -> str:
@@ -42,7 +86,7 @@ async def _judge_item(
     ratings: dict[str, int] = {}
     readouts: dict[str, Readout] = {}
     evidence: dict[str, str] | None = {} if mode == "explain" else None
-    user = build_user_message(rubric, text)
+    user = build_user_message(rubric, text, mode)
 
     async def generate(prefix: str, max_tokens: int) -> str:
         stats.calls += 1

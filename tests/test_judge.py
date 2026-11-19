@@ -10,6 +10,7 @@ from gavel.backends.openai_compat import OpenAICompatBackend
 from gavel.judge import (
     build_user_message,
     check_single_token_labels,
+    format_section,
     judge,
     judge_item,
 )
@@ -27,6 +28,51 @@ def run(coro):
 def backend_for(mock: MockLLM) -> OpenAICompatBackend:
     client = httpx.AsyncClient(transport=mock.transport)
     return OpenAICompatBackend("http://mock", "tiny", client=client)
+
+
+def test_format_section_lean_exactly_matches_demo_rubric() -> None:
+    rubric = load_rubric(FIXTURE)
+    expected = """# Output format
+
+Your reply is one JSON object written by the scoring engine:
+{"fields":{"summary":"<text, under 40 tokens>"},"ratings":{"clarity":<integer 0 to 5>,"accuracy":<integer 0 to 5>,"tone":<integer 0 to 5>}}
+
+Each rating is a single digit. Meaning of each rating:
+- clarity (Clarity): 0 = worst, 5 = best
+- accuracy (Accuracy): 0 = worst, 5 = best
+- tone (Tone): 0 = worst, 5 = best
+
+Write each text field as plain prose with no quote characters."""
+    assert format_section(rubric) == expected
+
+
+def test_format_section_explain_exactly_matches_demo_rubric() -> None:
+    rubric = load_rubric(FIXTURE)
+    expected = """# Output format
+
+Your reply is one JSON object written by the scoring engine:
+{"fields":{"summary":"<text, under 40 tokens>"},"ratings":{"clarity":{"evidence":"<one short sentence>","val":<integer 0 to 5>},"accuracy":{"evidence":"<one short sentence>","val":<integer 0 to 5>},"tone":{"evidence":"<one short sentence>","val":<integer 0 to 5>}}}
+
+Each rating is a single digit. Meaning of each rating:
+- clarity (Clarity): 0 = worst, 5 = best
+- accuracy (Accuracy): 0 = worst, 5 = best
+- tone (Tone): 0 = worst, 5 = best
+
+Write each text field as plain prose with no quote characters."""
+    assert format_section(rubric, mode="explain") == expected
+
+
+def test_format_section_without_fields_has_empty_object_and_no_prose_line() -> None:
+    expected = """# Output format
+
+Your reply is one JSON object written by the scoring engine:
+{"fields":{},"ratings":{"quality":<integer 0 to 5>}}
+
+Each rating is a single digit. Meaning of each rating:
+- quality (Quality): 0 = worst, 5 = best"""
+    section = format_section(one_dimension())
+    assert section == expected
+    assert "plain prose" not in section
 
 
 def test_lean_expected_values_score_order_and_stats() -> None:
@@ -68,7 +114,7 @@ def test_user_message_is_identical_for_equal_text_and_preamble_first() -> None:
     )
     users = [request["messages"][0]["content"] for request in mock.requests]
     assert len(set(users)) == 1
-    assert users[0].startswith(rubric.preamble)
+    assert users[0].startswith(rubric.preamble + "\n\n# Output format")
     assert users[0] == build_user_message(rubric, "Same")
 
 
@@ -145,7 +191,9 @@ def test_explain_generates_evidence_before_each_rating() -> None:
     )
     mock = MockLLM()
     result = run(judge_item(backend_for(mock), rubric, "a", "text", mode="explain"))
+    users = [request["messages"][0]["content"] for request in mock.requests]
     prefixes = [request["messages"][1]["content"] for request in mock.requests]
+    assert all('"first":{"evidence":"<one short sentence>"' in user for user in users)
     assert '"first":{"evidence":"' in prefixes[0]
     assert prefixes[1].endswith('"val":')
     assert '"second":{"evidence":"' in prefixes[2]
