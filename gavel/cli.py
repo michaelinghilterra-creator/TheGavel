@@ -11,10 +11,13 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+import uvicorn
+
 from .backends.openai_compat import OpenAICompatBackend
 from .judge import check_single_token_labels, judge
 from .metrics import pearson, recall_fp, run_noise, spearman
 from .rubric import load_rubric
+from .server import create_app
 
 
 BackendFactory = Callable[[str, str, str | None], object]
@@ -56,6 +59,12 @@ def _parser() -> argparse.ArgumentParser:
     bench.add_argument("labelled")
     bench.add_argument("--runs", type=int, default=2)
     bench.add_argument("--json", action="store_true")
+
+    serve = subparsers.add_parser("serve")
+    _add_shared(serve, defaults=False)
+    serve.add_argument("--rubric", action="append", required=True)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8090)
     return parser
 
 
@@ -210,8 +219,32 @@ async def _run(args: argparse.Namespace, backend_factory: BackendFactory | None)
         await _close_backend(backend)
 
 
+def _serve(args: argparse.Namespace, backend_factory: BackendFactory | None) -> int:
+    try:
+        rubric_list = [load_rubric(path) for path in args.rubric]
+    except (OSError, ValueError) as exc:
+        print(f"input error: {exc}", file=sys.stderr)
+        return 2
+
+    factory = backend_factory or (
+        lambda base_url, model, api_key: OpenAICompatBackend(
+            base_url, model, api_key=api_key
+        )
+    )
+    backend = lambda: factory(args.base_url, args.model, args.api_key)
+    app = create_app(
+        backend,
+        {rubric.name: rubric for rubric in rubric_list},
+        label_check=not args.no_label_check,
+    )
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
+
+
 def main(argv: list[str] | None = None, backend_factory: BackendFactory | None = None) -> int:
     """Run the command line interface and return its process status."""
 
     args = _parser().parse_args(argv)
+    if args.command == "serve":
+        return _serve(args, backend_factory)
     return asyncio.run(_run(args, backend_factory))

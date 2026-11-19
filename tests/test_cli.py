@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import httpx
+from fastapi import FastAPI
 
 from gavel.backends.openai_compat import OpenAICompatBackend
 from gavel.cli import main
@@ -92,3 +93,28 @@ def test_no_label_check_skips_probe_requests(capsys) -> None:
     assert code == 0
     assert len(mock.requests) == 20
     assert not any(request["messages"][0]["content"].startswith("Reply with") for request in mock.requests)
+
+
+def test_serve_builds_app_and_runs_uvicorn(monkeypatch) -> None:
+    called = {}
+
+    def fake_run(app, *, host, port):
+        called.update(app=app, host=host, port=port)
+
+    monkeypatch.setattr("gavel.cli.uvicorn.run", fake_run)
+    code = main(
+        [
+            "serve",
+            "--rubric",
+            str(RUBRIC),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9000",
+        ],
+        backend_factory=factory_for(checked_mock()),
+    )
+    assert code == 0
+    assert called["host"] == "0.0.0.0"
+    assert called["port"] == 9000
+    assert isinstance(called["app"], FastAPI)
