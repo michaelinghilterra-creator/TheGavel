@@ -1,0 +1,217 @@
+"""Command line interface for scoring and benchmarking."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import inspect
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Callable
+
+from .backends.openai_compat import OpenAICompatBackend
+from .judge import check_single_token_labels, judge
+from .metrics import pearson, recall_fp, run_noise, spearman
+from .rubric import load_rubric
+
+
+BackendFactory = Callable[[str, str, str | None], object]
+
+
+def _add_shared(parser: argparse.ArgumentParser, *, defaults: bool) -> None:
+    default = None if defaults else argparse.SUPPRESS
+    parser.add_argument(
+        "--base-url",
+        default=(os.environ.get("GAVEL_BASE_URL", "http://localhost:8000") if defaults else default),
+    )
+    parser.add_argument(
+        "--model", default=(os.environ.get("GAVEL_MODEL", "default") if defaults else default)
+    )
+    parser.add_argument(
+        "--api-key", default=(os.environ.get("GAVEL_API_KEY") if defaults else default)
+    )
+    parser.add_argument("--mode", choices=("lean", "explain"), default=("lean" if defaults else default))
+    parser.add_argument("--concurrency", type=int, default=(8 if defaults else default))
+    parser.add_argument(
+        "--no-label-check", action="store_true", default=(False if defaults else default)
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="gavel")
+    _add_shared(parser, defaults=True)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    score = subparsers.add_parser("score")
+    _add_shared(score, defaults=False)
+    score.add_argument("rubric")
+    score.add_argument("items")
+    score.add_argument("--out")
+
+    bench = subparsers.add_parser("bench")
+    _add_shared(bench, defaults=False)
+    bench.add_argument("rubric")
+    bench.add_argument("labelled")
+    bench.add_argument("--runs", type=int, default=2)
+    bench.add_argument("--json", action="store_true")
+    return parser
+
+
+def _load_jsonl(path: str, *, labelled: bool) -> list[dict]:
+    items = []
+    with Path(path).open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid JSON") from exc
+            if not isinstance(item, dict) or "id" not in item or not isinstance(item.get("text"), str):
+                raise ValueError(f"{path}:{line_number}: expected id and text")
+            if labelled and (
+                not isinstance(item.get("label"), (int, float))
+                or isinstance(item.get("label"), bool)
+            ):
+                raise ValueError(f"{path}:{line_number}: expected numeric label")
+            items.append(item)
+    return items
+
+
+def _tokens_per_item(tokens: int, item_count: int) -> float:
+    return tokens / item_count if item_count else 0.0
+
+
+async def _close_backend(backend: object) -> None:
+    close = getattr(backend, "aclose", None)
+    if close is not None:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+
+
+async def _score(args: argparse.Namespace, backend: object, rubric, items: list[dict]) -> int:
+    if not args.no_label_check:
+        await check_single_token_labels(backend, rubric)
+    results, stats = await judge(
+        backend, rubric, items, mode=args.mode, concurrency=args.concurrency
+    )
+    lines = [json.dumps(result, ensure_ascii=False) for result in results]
+    if args.out:
+        Path(args.out).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    else:
+        for line in lines:
+            print(line)
+    errors = sum("error" in result for result in results)
+    print(
+        f"items {len(items)} ok {len(items) - errors} errors {errors} "
+        f"calls {stats.calls} generated_tokens_per_item "
+        f"{_tokens_per_item(stats.generated_tokens, len(items)):.3f} "
+        f"wall_seconds {stats.wall_s:.3f}",
+        file=sys.stderr,
+    )
+    return 1 if errors else 0
+
+
+async def _bench(args: argparse.Namespace, backend: object, rubric, items: list[dict]) -> int:
+    if args.runs < 1:
+        raise ValueError("runs must be at least 1")
+    if not args.no_label_check:
+        await check_single_token_labels(backend, rubric)
+    truth_by_id = {str(item["id"]): float(item["label"]) for item in items}
+    reports = []
+    score_maps = []
+    for run_number in range(1, args.runs + 1):
+        results, stats = await judge(
+            backend, rubric, items, mode=args.mode, concurrency=args.concurrency
+        )
+        scores = {
+            str(result["id"]): float(result["score"])
+            for result in results
+            if "error" not in result and result.get("score") is not None
+        }
+        ids = [str(item["id"]) for item in items if str(item["id"]) in scores]
+        truth = [truth_by_id[item_id] for item_id in ids]
+        predicted = [scores[item_id] for item_id in ids]
+        report = {
+            "run": run_number,
+            "n": len(scores),
+            "spearman": spearman(truth, predicted),
+            "pearson": pearson(truth, predicted),
+            "generated_tokens_per_item": _tokens_per_item(stats.generated_tokens, len(items)),
+            "wall_seconds": stats.wall_s,
+        }
+        if rubric.threshold is not None:
+            report["threshold"] = rubric.threshold
+            report.update(recall_fp(truth, predicted, rubric.threshold))
+        reports.append(report)
+        score_maps.append(scores)
+    output = {"runs": reports}
+    if args.runs >= 2:
+        output["noise"] = run_noise(score_maps[0], score_maps[1])
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False))
+    else:
+        for report in reports:
+            fields = [
+                f"run {report['run']}",
+                f"n {report['n']}",
+                f"spearman {report['spearman']}",
+                f"pearson {report['pearson']}",
+            ]
+            if rubric.threshold is not None:
+                fields.extend(
+                    [
+                        f"recall {report['recall']}",
+                        f"fp {report['fp']}",
+                    ]
+                )
+            fields.extend(
+                [
+                    f"generated_tokens_per_item {report['generated_tokens_per_item']:.3f}",
+                    f"wall_seconds {report['wall_seconds']:.3f}",
+                ]
+            )
+            print(" ".join(fields))
+        if "noise" in output:
+            noise = output["noise"]
+            print(
+                f"noise n {noise['n']} mean_abs_delta {noise['mean_abs_delta']} "
+                f"max_abs_delta {noise['max_abs_delta']} moved_ge_1 {noise['moved_ge_1']}"
+            )
+    return 0
+
+
+async def _run(args: argparse.Namespace, backend_factory: BackendFactory | None) -> int:
+    try:
+        rubric = load_rubric(args.rubric)
+        source = args.items if args.command == "score" else args.labelled
+        items = _load_jsonl(source, labelled=args.command == "bench")
+    except (OSError, ValueError) as exc:
+        print(f"input error: {exc}", file=sys.stderr)
+        return 2
+
+    factory = backend_factory or (
+        lambda base_url, model, api_key: OpenAICompatBackend(
+            base_url, model, api_key=api_key
+        )
+    )
+    backend = factory(args.base_url, args.model, args.api_key)
+    try:
+        if args.command == "score":
+            return await _score(args, backend, rubric, items)
+        return await _bench(args, backend, rubric, items)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await _close_backend(backend)
+
+
+def main(argv: list[str] | None = None, backend_factory: BackendFactory | None = None) -> int:
+    """Run the command line interface and return its process status."""
+
+    args = _parser().parse_args(argv)
+    return asyncio.run(_run(args, backend_factory))
