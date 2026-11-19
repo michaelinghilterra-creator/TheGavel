@@ -27,9 +27,12 @@ def _add_shared(parser: argparse.ArgumentParser, *, defaults: bool) -> None:
     default = None if defaults else argparse.SUPPRESS
     parser.add_argument(
         "--backend",
-        choices=("openai", "native"),
+        choices=("openai", "native", "completions"),
         default=("openai" if defaults else default),
     )
+    parser.add_argument("--tokenizer", default=default)
+    parser.add_argument("--prompt-format", choices=("chatml",), default=default)
+    parser.add_argument("--template-kwargs", default=("{}" if defaults else default))
     parser.add_argument("--model-path", default=default)
     parser.add_argument("--device", default=("cuda" if defaults else default))
     parser.add_argument("--dtype", default=("bfloat16" if defaults else default))
@@ -105,6 +108,24 @@ def _tokens_per_item(tokens: int, item_count: int) -> float:
 def _default_backend(args: argparse.Namespace) -> object:
     if args.backend == "openai":
         return OpenAICompatBackend(args.base_url, args.model, api_key=args.api_key)
+    if args.backend == "completions":
+        from .backends.completions import (
+            CompletionsBackend,
+            chatml_renderer,
+            tokenizer_renderer,
+        )
+
+        render = (
+            tokenizer_renderer(args.tokenizer, args.template_kwargs)
+            if args.tokenizer
+            else chatml_renderer
+        )
+        return CompletionsBackend(
+            args.base_url,
+            args.model,
+            api_key=args.api_key,
+            render=render,
+        )
 
     from .backends.native import NativeBackend
 
@@ -322,6 +343,21 @@ def main(argv: list[str] | None = None, backend_factory: BackendFactory | None =
             file=sys.stderr,
         )
         return 2
+    if args.backend == "completions":
+        if bool(args.tokenizer) == bool(args.prompt_format):
+            print(
+                "input error: --backend completions needs --tokenizer or --prompt-format",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            args.template_kwargs = json.loads(args.template_kwargs)
+        except (json.JSONDecodeError, TypeError) as exc:
+            print(f"input error: invalid --template-kwargs JSON: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(args.template_kwargs, dict):
+            print("input error: --template-kwargs must be a JSON object", file=sys.stderr)
+            return 2
     if args.command == "serve":
         return _serve(args, backend_factory)
     return asyncio.run(_run(args, backend_factory))

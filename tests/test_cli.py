@@ -98,6 +98,41 @@ def test_native_requires_model_path(capsys) -> None:
     )
 
 
+def test_completions_requires_one_prompt_renderer(capsys) -> None:
+    code = main(
+        [
+            "score",
+            str(RUBRIC),
+            str(FIXTURES / "demo_items.jsonl"),
+            "--backend",
+            "completions",
+        ]
+    )
+    assert code == 2
+    assert (
+        "input error: --backend completions needs --tokenizer or --prompt-format"
+        in capsys.readouterr().err
+    )
+
+
+def test_completions_rejects_bad_template_kwargs(capsys) -> None:
+    code = main(
+        [
+            "score",
+            str(RUBRIC),
+            str(FIXTURES / "demo_items.jsonl"),
+            "--backend",
+            "completions",
+            "--prompt-format",
+            "chatml",
+            "--template-kwargs",
+            "{bad",
+        ]
+    )
+    assert code == 2
+    assert "input error: invalid --template-kwargs JSON" in capsys.readouterr().err
+
+
 def test_score_prints_native_stats(capsys) -> None:
     code = main(
         ["score", str(RUBRIC), str(FIXTURES / "demo_items.jsonl")],
