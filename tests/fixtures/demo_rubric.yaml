@@ -1,0 +1,19 @@
+name: demo-reviews
+preamble_file: demo_preamble.md
+threshold: 3.5
+fields:
+  - key: summary
+    max_tokens: 40
+dimensions:
+  - key: clarity
+    label: Clarity
+    weight: 2
+  - key: accuracy
+    label: Accuracy
+    min: 0
+    max: 5
+    cap_below: 2
+    cap_to: 2.5
+  - key: tone
+    label: Tone
+    weight: 1
