@@ -13,8 +13,9 @@ from transformers import (
     LlamaForCausalLM,
     PreTrainedTokenizerFast,
 )
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 
-from gavel.backends.native import NativeBackend, gavel_sdpa
+from gavel.backends.native import NativeBackend, gavel_sdpa, gavel_sdpa_mask
 from gavel.judge import build_user_message, judge
 from gavel.rubric import load_rubric
 
@@ -139,6 +140,12 @@ def test_gavel_sdpa_refuses_batch_size_two() -> None:
         gavel_sdpa(None, query, key, value, None)
 
 
+def test_gavel_sdpa_mask_is_registered_and_skips_allocation() -> None:
+    mask_function = ALL_MASK_ATTENTION_FUNCTIONS["gavel_sdpa"]
+    assert mask_function is gavel_sdpa_mask
+    assert mask_function(unused=True) is None
+
+
 def test_static_cache_matches_dynamic_prefill_decode_and_judge(
     native_factory,
 ) -> None:
@@ -204,7 +211,7 @@ def test_static_cache_deepcopy_is_independent(native_factory) -> None:
     backend = native_factory()
     with torch.inference_mode():
         _, original, _ = backend._prefill(list(range(32)))
-        original_length = int(original.get_seq_length().item())
+        original_length = original.get_seq_length()
         original_keys = original.layers[0].keys.clone()
         copied = copy.deepcopy(original)
         backend.model(
@@ -213,9 +220,42 @@ def test_static_cache_deepcopy_is_independent(native_factory) -> None:
             use_cache=True,
         )
 
-    assert int(copied.get_seq_length().item()) == original_length + 1
-    assert int(original.get_seq_length().item()) == original_length
+    assert copied.get_seq_length() == original_length + 1
+    assert original.get_seq_length() == original_length
     assert torch.equal(original.layers[0].keys, original_keys)
+
+
+def test_static_cache_model_forwards_do_not_sync_lengths(
+    native_factory, monkeypatch
+) -> None:
+    backend = native_factory()
+    cache = backend._new_cache()
+    original_item = torch.Tensor.item
+    calls = 0
+
+    def counting_item(tensor, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_item(tensor, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", counting_item)
+        with torch.inference_mode():
+            output = backend.model(
+                input_ids=torch.tensor([list(range(16))]),
+                past_key_values=cache,
+                use_cache=True,
+            )
+        assert calls == 0
+
+        token_id = backend._ordered_ids(output.logits[:, -1, :][0], 1)[0]
+        with torch.inference_mode():
+            backend.model(
+                input_ids=torch.tensor([[token_id]]),
+                past_key_values=cache,
+                use_cache=True,
+            )
+        assert calls <= 1
 
 
 def test_static_cache_refuses_updates_past_max_len(native_factory) -> None:
@@ -336,6 +376,21 @@ def test_generation_honors_stop_max_tokens_and_eos(native_factory) -> None:
         backend.tokenizer.eos_token_id = old_eos
     assert text == ""
     assert count == 1
+
+
+def test_generation_stop_spanning_two_tokens_keeps_preceding_text(
+    native_factory,
+) -> None:
+    backend = native_factory()
+    token_ids = iter(backend.tokenizer.convert_tokens_to_ids(list("abc")))
+    backend._ordered_ids = MethodType(
+        lambda self, logprobs, count: [next(token_ids)], backend
+    )
+
+    text, count = run(backend.generate("user", "", 5, ["bc"]))
+
+    assert text == "a"
+    assert count == 3
 
 
 def test_hybrid_attention_is_refused(native_factory) -> None:

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.nn.attention.bias import causal_lower_right
 from transformers import AttentionInterface, AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache, StaticCache, StaticLayer
+from transformers.masking_utils import AttentionMaskInterface
 
 torch.use_deterministic_algorithms(True)
 
@@ -57,37 +58,61 @@ def gavel_sdpa(
 AttentionInterface.register("gavel_sdpa", gavel_sdpa)
 
 
+def gavel_sdpa_mask(**kwargs):
+    """Skip HF mask allocation because gavel_sdpa supplies causality."""
+
+    # Batch size 1 has no padding. gavel_sdpa builds a lower-right causal bias.
+    return None
+
+
+AttentionMaskInterface.register("gavel_sdpa", gavel_sdpa_mask)
+
+
 class GavelStaticLayer(StaticLayer):
     """Preallocated cache layer that exposes only populated positions."""
+
+    def __init__(self, max_cache_len: int):
+        super().__init__(max_cache_len)
+        self.length = 0
 
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        current = int(self.cumulative_length.item())
         update_length = key_states.shape[-2]
-        resulting_length = current + update_length
+        resulting_length = self.length + update_length
         if resulting_length > self.max_cache_len:
             raise ValueError(
                 f"cache length {resulting_length} exceeds max_cache_len "
-                f"{self.max_cache_len} (current length {current}, update length "
+                f"{self.max_cache_len} (current length {self.length}, update length "
                 f"{update_length})"
             )
         keys, values = super().update(key_states, value_states, *args, **kwargs)
+        self.length = resulting_length
         return (
-            keys[:, :, : self.cumulative_length],
-            values[:, :, : self.cumulative_length],
+            keys[:, :, : self.length],
+            values[:, :, : self.length],
         )
 
     def crop(self, max_length: int) -> None:
         """Reduce the valid length without moving cached data."""
 
-        current = int(self.cumulative_length.item())
         if isinstance(max_length, torch.Tensor):
-            max_length = int(max_length.item())
+            max_length = int(max_length)
         if max_length < 0:
-            max_length = current + max_length
-        new_length = max(0, min(current, max_length))
-        self.cumulative_length.fill_(new_length)
+            max_length = self.length + max_length
+        self.length = max(0, min(self.length, max_length))
+        self.cumulative_length.fill_(self.length)
+
+    def get_seq_length(self) -> int:
+        """Return the populated length without synchronizing the device."""
+
+        return self.length
+
+    def reset(self) -> None:
+        """Reset both the tensor and Python length trackers."""
+
+        super().reset()
+        self.length = 0
 
 
 @dataclass
@@ -343,7 +368,8 @@ class NativeBackend:
         logits, cache, boundaries = self._prefill(ids)
         generated: list[int] = []
         eos_id = self.tokenizer.eos_token_id
-        text = ""
+        check_text = ""
+        stopped_text = None
         decode_started = time.perf_counter()
 
         for _ in range(max(0, max_tokens)):
@@ -352,11 +378,23 @@ class NativeBackend:
             if token_id == eos_id:
                 break
 
-            text = self.tokenizer.decode(generated)
-            found = [text.find(value) for value in stop if value and value in text]
+            check_text += self.tokenizer.decode([token_id])
+            found = [
+                check_text.find(value)
+                for value in stop
+                if value and value in check_text
+            ]
             if found:
-                text = text[: min(found)]
-                break
+                candidate = self.tokenizer.decode(generated)
+                exact_found = [
+                    candidate.find(value)
+                    for value in stop
+                    if value and value in candidate
+                ]
+                if exact_found:
+                    stopped_text = candidate[: min(exact_found)]
+                    break
+                check_text = candidate
 
             inputs = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
             outputs = self.model(
@@ -366,6 +404,17 @@ class NativeBackend:
             )
             cache = outputs.past_key_values
             logits = outputs.logits[:, -1, :]
+
+        text_ids = (
+            generated[:-1]
+            if generated and generated[-1] == eos_id
+            else generated
+        )
+        text = (
+            stopped_text
+            if stopped_text is not None
+            else self.tokenizer.decode(text_ids)
+        )
 
         self.stats.decode_tokens += len(generated)
         self.stats.decode_s += time.perf_counter() - decode_started
