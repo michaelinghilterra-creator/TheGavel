@@ -91,6 +91,20 @@ def test_range_cannot_exceed_nine() -> None:
         rubric_from_dict(data)
 
 
+def test_min_cannot_be_negative() -> None:
+    data = base_data()
+    data["dimensions"] = [{"key": "quality", "min": -1, "max": 5}]
+    with pytest.raises(ValueError, match="negative"):
+        rubric_from_dict(data)
+
+
+def test_max_cannot_exceed_nine() -> None:
+    data = base_data()
+    data["dimensions"] = [{"key": "quality", "min": 1, "max": 10}]
+    with pytest.raises(ValueError, match="exceed 9"):
+        rubric_from_dict(data)
+
+
 def test_weight_cannot_be_negative() -> None:
     data = base_data()
     data["dimensions"] = [{"key": "quality", "weight": -0.1}]

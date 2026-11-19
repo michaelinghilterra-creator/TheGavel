@@ -67,6 +67,10 @@ def _dimension_from_dict(item: dict[str, Any]) -> Dimension:
 
     if minimum >= maximum:
         raise ValueError(f"dimension {key!r} must have min less than max")
+    if minimum < 0:
+        raise ValueError(f"dimension {key!r} range min cannot be negative")
+    if maximum > 9:
+        raise ValueError(f"dimension {key!r} range max cannot exceed 9")
     if maximum - minimum > 9:
         raise ValueError(f"dimension {key!r} range cannot exceed 9")
     if weight < 0:
