@@ -2,13 +2,19 @@ import asyncio
 import copy
 import string
 from pathlib import Path
+from types import MethodType
 
 import pytest
 import torch
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
+from transformers import (
+    DynamicCache,
+    LlamaConfig,
+    LlamaForCausalLM,
+    PreTrainedTokenizerFast,
+)
 
-from gavel.backends.native import NativeBackend
+from gavel.backends.native import NativeBackend, gavel_sdpa
 from gavel.judge import build_user_message, judge
 from gavel.rubric import load_rubric
 
@@ -52,6 +58,7 @@ def native_factory():
         intermediate_size=64,
         max_position_embeddings=2048,
         eos_token_id=tokenizer.eos_token_id,
+        attn_implementation="gavel_sdpa",
     )
     original = LlamaForCausalLM(config).eval()
     state = copy.deepcopy(original.state_dict())
@@ -71,6 +78,125 @@ def test_cached_logprobs_are_bit_identical_to_cold(native_factory) -> None:
     cached, _ = run(warm.next_token_logprobs("A" * 80 + " tail", "prefix"))
     direct, _ = run(cold.next_token_logprobs("A" * 80 + " tail", "prefix"))
     assert cached == direct
+
+
+def test_gavel_sdpa_matches_default_sdpa_for_prefill_and_decode() -> None:
+    torch.manual_seed(1)
+    common = dict(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=64,
+        max_position_embeddings=256,
+    )
+    reference = LlamaForCausalLM(
+        LlamaConfig(**common, attn_implementation="sdpa")
+    ).eval()
+    candidate = LlamaForCausalLM(
+        LlamaConfig(**common, attn_implementation="gavel_sdpa")
+    ).eval()
+    candidate.load_state_dict(reference.state_dict())
+    token_ids = torch.arange(50).remainder(common["vocab_size"]).unsqueeze(0)
+    reference_cache = DynamicCache()
+    candidate_cache = DynamicCache()
+
+    with torch.inference_mode():
+        for start in range(0, 50, 16):
+            chunk = token_ids[:, start : start + 16]
+            expected = reference(
+                input_ids=chunk,
+                past_key_values=reference_cache,
+                use_cache=True,
+            )
+            actual = candidate(
+                input_ids=chunk,
+                past_key_values=candidate_cache,
+                use_cache=True,
+            )
+            assert torch.allclose(actual.logits, expected.logits, atol=1e-5)
+        for step in range(5):
+            chunk = torch.tensor([[50 + step]])
+            expected = reference(
+                input_ids=chunk,
+                past_key_values=reference_cache,
+                use_cache=True,
+            )
+            actual = candidate(
+                input_ids=chunk,
+                past_key_values=candidate_cache,
+                use_cache=True,
+            )
+            assert torch.allclose(actual.logits, expected.logits, atol=1e-5)
+
+
+def test_gavel_sdpa_refuses_batch_size_two() -> None:
+    query = torch.zeros(2, 4, 3, 8)
+    key = torch.zeros(2, 2, 3, 8)
+    value = torch.zeros(2, 2, 3, 8)
+    with pytest.raises(ValueError, match="batch size 1"):
+        gavel_sdpa(None, query, key, value, None)
+
+
+def test_pure_extensions_make_no_cache_copies(native_factory) -> None:
+    warm = native_factory()
+    cold = native_factory()
+    prefixes = ["A" * 40, "A" * 80, "A" * 120]
+    for prefix in prefixes:
+        warm_result, _ = run(warm.next_token_logprobs("user", prefix))
+    cold_result, _ = run(cold.next_token_logprobs("user", prefixes[-1]))
+    assert warm.stats.copies == 0
+    assert warm_result == cold_result
+
+
+def test_judge_matches_copy_always_cache_behavior(native_factory) -> None:
+    rubric = load_rubric(FIXTURE)
+    items = [
+        {"id": "one", "text": "A clear short answer."},
+        {"id": "two", "text": "A vague answer."},
+        {"id": "three", "text": "A careful factual answer."},
+    ]
+    current = native_factory()
+    copy_always = native_factory()
+
+    def copied_start(self, ids):
+        best_key = None
+        best_common = 0
+        for key in self._cache:
+            common = self._common_prefix(key, ids)
+            if common > best_common:
+                best_key = key
+                best_common = common
+        reused = (best_common // self.chunk) * self.chunk
+        if best_key is None or reused == 0:
+            return None, 0, None, {}
+        cached = copy.deepcopy(self._cache[best_key])
+        self.stats.copies += 1
+        current_length = cached.get_seq_length()
+        if current_length > reused:
+            cached.crop(reused - current_length)
+        known_logits = self._cache_logits[best_key]
+        logits = known_logits.get(reused)
+        boundaries = {
+            length: value.clone()
+            for length, value in known_logits.items()
+            if length <= reused
+        }
+        self._cache.move_to_end(best_key)
+        return (
+            cached,
+            reused,
+            logits.clone() if logits is not None else None,
+            boundaries,
+        )
+
+    copy_always._cached_start = MethodType(copied_start, copy_always)
+    expected, _ = run(
+        judge(copy_always, rubric, items, mode="lean", concurrency=1)
+    )
+    actual, _ = run(judge(current, rubric, items, mode="lean", concurrency=1))
+    assert actual == expected
 
 
 def test_judge_is_bit_identical_across_concurrency(native_factory) -> None:
@@ -134,12 +260,13 @@ def test_hybrid_attention_is_refused(native_factory) -> None:
         NativeBackend(backend.model, backend.tokenizer, chunk=16)
 
 
-def test_serving_shorter_prompt_does_not_mutate_entry(native_factory) -> None:
+def test_shorter_divergent_prompt_copies_and_preserves_entry(native_factory) -> None:
     backend = native_factory()
     run(backend.next_token_logprobs("Z" * 100, "prefix"))
     entry = next(iter(backend._cache.values()))
     original_length = entry.get_seq_length()
     run(backend.next_token_logprobs("Z" * 40, "prefix"))
+    assert backend.stats.copies == 1
     assert entry.get_seq_length() == original_length
 
 

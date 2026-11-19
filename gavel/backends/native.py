@@ -12,9 +12,48 @@ from dataclasses import dataclass
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch.nn.functional as F
+from torch.nn.attention.bias import causal_lower_right
+from transformers import AttentionInterface, AutoModelForCausalLM, AutoTokenizer
 
 torch.use_deterministic_algorithms(True)
+
+
+def gavel_sdpa(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    dropout=0.0,
+    scaling=None,
+    **kwargs,
+):
+    """Run causal SDPA without expanding grouped key and value heads."""
+
+    if query.shape[0] != 1:
+        raise ValueError("gavel_sdpa requires batch size 1")
+    query_length = query.shape[2]
+    key_length = key.shape[2]
+    # Ignore HF's attention mask: batch size 1 has no padding, only causality.
+    mask = (
+        None
+        if query_length == 1
+        else causal_lower_right(query_length, key_length)
+    )
+    output = F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=mask,
+        dropout_p=dropout,
+        scale=scaling,
+        enable_gqa=key.shape[1] != query.shape[1],
+    )
+    return output.transpose(1, 2).contiguous(), None
+
+
+AttentionInterface.register("gavel_sdpa", gavel_sdpa)
 
 
 @dataclass
@@ -27,6 +66,7 @@ class NativeStats:
     decode_tokens: int = 0
     decode_s: float = 0.0
     calls: int = 0
+    copies: int = 0
 
 
 class NativeBackend:
@@ -79,7 +119,11 @@ class NativeBackend:
     ) -> "NativeBackend":
         """Load a local model and tokenizer without changing other backends."""
 
-        model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype)
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            dtype=dtype,
+            attn_implementation="gavel_sdpa",
+        )
         tokenizer = AutoTokenizer.from_pretrained(path)
         model.eval()
         model.to(device)
@@ -127,18 +171,25 @@ class NativeBackend:
         if best_key is None or reused == 0:
             return None, 0, None, {}
 
-        cached = copy.deepcopy(self._cache[best_key])
-        current = cached.get_seq_length()
+        entry = self._cache[best_key]
+        current = entry.get_seq_length()
+        known_logits = self._cache_logits[best_key]
+        if current == reused:
+            cached = self._cache.pop(best_key)
+            del self._cache_logits[best_key]
+        else:
+            cached = copy.deepcopy(entry)
+            self.stats.copies += 1
         if current > reused:
             cached.crop(reused - current)
-        known_logits = self._cache_logits[best_key]
         logits = known_logits.get(reused)
         boundaries = {
             length: value.clone()
             for length, value in known_logits.items()
             if length <= reused
         }
-        self._cache.move_to_end(best_key)
+        if best_key in self._cache:
+            self._cache.move_to_end(best_key)
         return cached, reused, logits.clone() if logits is not None else None, boundaries
 
     def _store_cache(
@@ -148,17 +199,16 @@ class NativeBackend:
         if aligned == 0 or self.cache_entries == 0:
             return
 
-        stored = copy.deepcopy(cache)
-        current = stored.get_seq_length()
+        current = cache.get_seq_length()
         if current > aligned:
-            stored.crop(aligned - current)
+            cache.crop(aligned - current)
         key = tuple(ids[:aligned])
 
         for old_key in list(self._cache):
             if len(old_key) <= len(key) and key[: len(old_key)] == old_key:
                 del self._cache[old_key]
                 del self._cache_logits[old_key]
-        self._cache[key] = stored
+        self._cache[key] = cache
         self._cache_logits[key] = {
             length: value.clone()
             for length, value in boundaries.items()
@@ -192,11 +242,10 @@ class NativeBackend:
         if logits is None:
             raise RuntimeError("aligned cache entry has no boundary logits")
 
-        self._store_cache(ids, cache, boundaries)
         self.stats.reused_tokens += reused
         self.stats.prefill_tokens += len(ids) - reused
         self.stats.prefill_s += time.perf_counter() - started
-        return logits, cache
+        return logits, cache, boundaries
 
     @staticmethod
     def _ordered_ids(logprobs: torch.Tensor, count: int) -> list[int]:
@@ -210,7 +259,8 @@ class NativeBackend:
     ) -> tuple[list[dict], int]:
         self.stats.calls += 1
         ids = self._prompt_ids(user, prefix)
-        logits, _ = self._prefill(ids)
+        logits, cache, boundaries = self._prefill(ids)
+        self._store_cache(ids, cache, boundaries)
         logprobs = torch.log_softmax(logits[0].float(), dim=-1)
         values = [
             {
@@ -241,7 +291,7 @@ class NativeBackend:
     ) -> tuple[str, int]:
         self.stats.calls += 1
         ids = self._prompt_ids(user, prefix)
-        logits, cache = self._prefill(ids)
+        logits, cache, boundaries = self._prefill(ids)
         generated: list[int] = []
         eos_id = self.tokenizer.eos_token_id
         text = ""
@@ -270,6 +320,7 @@ class NativeBackend:
 
         self.stats.decode_tokens += len(generated)
         self.stats.decode_s += time.perf_counter() - decode_started
+        self._store_cache(ids, cache, boundaries)
         return text, len(generated)
 
     async def generate(
