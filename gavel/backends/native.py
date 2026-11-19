@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention.bias import causal_lower_right
 from transformers import AttentionInterface, AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import Cache, StaticCache, StaticLayer
 
 torch.use_deterministic_algorithms(True)
 
@@ -56,6 +57,39 @@ def gavel_sdpa(
 AttentionInterface.register("gavel_sdpa", gavel_sdpa)
 
 
+class GavelStaticLayer(StaticLayer):
+    """Preallocated cache layer that exposes only populated positions."""
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current = int(self.cumulative_length.item())
+        update_length = key_states.shape[-2]
+        resulting_length = current + update_length
+        if resulting_length > self.max_cache_len:
+            raise ValueError(
+                f"cache length {resulting_length} exceeds max_cache_len "
+                f"{self.max_cache_len} (current length {current}, update length "
+                f"{update_length})"
+            )
+        keys, values = super().update(key_states, value_states, *args, **kwargs)
+        return (
+            keys[:, :, : self.cumulative_length],
+            values[:, :, : self.cumulative_length],
+        )
+
+    def crop(self, max_length: int) -> None:
+        """Reduce the valid length without moving cached data."""
+
+        current = int(self.cumulative_length.item())
+        if isinstance(max_length, torch.Tensor):
+            max_length = int(max_length.item())
+        if max_length < 0:
+            max_length = current + max_length
+        new_length = max(0, min(current, max_length))
+        self.cumulative_length.fill_(new_length)
+
+
 @dataclass
 class NativeStats:
     """Timing and token counters for native inference."""
@@ -81,6 +115,7 @@ class NativeBackend:
         chunk: int = 256,
         cache_entries: int = 3,
         top_default: int = 20,
+        max_len: int = 32768,
     ):
         if chunk <= 0:
             raise ValueError("chunk must be positive")
@@ -103,10 +138,22 @@ class NativeBackend:
         self.chunk = chunk
         self.cache_entries = cache_entries
         self.top_default = top_default
+        self.max_len = max_len
         self.stats = NativeStats()
         self._lock = asyncio.Lock()
         self._cache: OrderedDict[tuple[int, ...], object] = OrderedDict()
         self._cache_logits: dict[tuple[int, ...], dict[int, torch.Tensor]] = {}
+
+    def _new_cache(self) -> Cache:
+        cache = StaticCache(
+            config=self.model.config,
+            max_cache_len=self.max_len,
+        )
+        cache.layers = [
+            GavelStaticLayer(max_cache_len=layer.max_cache_len)
+            for layer in cache.layers
+        ]
+        return cache
 
     @classmethod
     def from_pretrained(
@@ -225,6 +272,8 @@ class NativeBackend:
 
         started = time.perf_counter()
         cache, reused, logits, boundaries = self._cached_start(ids)
+        if cache is None:
+            cache = self._new_cache()
         for start in range(reused, len(ids), self.chunk):
             token_ids = ids[start : start + self.chunk]
             inputs = torch.tensor([token_ids], dtype=torch.long, device=self.device)

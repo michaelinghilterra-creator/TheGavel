@@ -139,6 +139,91 @@ def test_gavel_sdpa_refuses_batch_size_two() -> None:
         gavel_sdpa(None, query, key, value, None)
 
 
+def test_static_cache_matches_dynamic_prefill_decode_and_judge(
+    native_factory,
+) -> None:
+    static = native_factory()
+    dynamic = native_factory()
+    dynamic._new_cache = MethodType(lambda self: None, dynamic)
+    token_ids = list(range(60))
+
+    with torch.inference_mode():
+        static_logits, static_cache, _ = static._prefill(token_ids)
+        dynamic_logits, dynamic_cache, _ = dynamic._prefill(token_ids)
+        assert torch.equal(static_logits, dynamic_logits)
+        for _ in range(8):
+            token_id = static._ordered_ids(static_logits[0], 1)[0]
+            inputs = torch.tensor([[token_id]])
+            static_output = static.model(
+                input_ids=inputs,
+                past_key_values=static_cache,
+                use_cache=True,
+            )
+            dynamic_output = dynamic.model(
+                input_ids=inputs,
+                past_key_values=dynamic_cache,
+                use_cache=True,
+            )
+            static_cache = static_output.past_key_values
+            dynamic_cache = dynamic_output.past_key_values
+            static_logits = static_output.logits[:, -1, :]
+            dynamic_logits = dynamic_output.logits[:, -1, :]
+            assert torch.equal(static_logits, dynamic_logits)
+
+    rubric = load_rubric(FIXTURE)
+    items = [
+        {"id": "one", "text": "A clear short answer."},
+        {"id": "two", "text": "A vague answer."},
+        {"id": "three", "text": "A careful factual answer."},
+    ]
+    expected, _ = run(judge(dynamic, rubric, items, mode="lean", concurrency=1))
+    actual, _ = run(judge(static, rubric, items, mode="lean", concurrency=1))
+    assert actual == expected
+
+
+def test_static_cache_crop_then_extend_matches_cold(native_factory) -> None:
+    reused = native_factory()
+    cold = native_factory()
+    token_ids = list(range(64))
+
+    with torch.inference_mode():
+        _, cache, _ = reused._prefill(token_ids[:48])
+        cache.crop(-16)
+        for start in range(32, 64, 16):
+            output = reused.model(
+                input_ids=torch.tensor([token_ids[start : start + 16]]),
+                past_key_values=cache,
+                use_cache=True,
+            )
+        expected, _, _ = cold._prefill(token_ids)
+
+    assert torch.equal(output.logits[:, -1, :], expected)
+
+
+def test_static_cache_deepcopy_is_independent(native_factory) -> None:
+    backend = native_factory()
+    with torch.inference_mode():
+        _, original, _ = backend._prefill(list(range(32)))
+        original_length = int(original.get_seq_length().item())
+        original_keys = original.layers[0].keys.clone()
+        copied = copy.deepcopy(original)
+        backend.model(
+            input_ids=torch.tensor([[32]]),
+            past_key_values=copied,
+            use_cache=True,
+        )
+
+    assert int(copied.get_seq_length().item()) == original_length + 1
+    assert int(original.get_seq_length().item()) == original_length
+    assert torch.equal(original.layers[0].keys, original_keys)
+
+
+def test_static_cache_refuses_updates_past_max_len(native_factory) -> None:
+    backend = native_factory(max_len=16)
+    with pytest.raises(ValueError, match=r"17.*16"):
+        backend._prefill(list(range(17)))
+
+
 def test_pure_extensions_make_no_cache_copies(native_factory) -> None:
     warm = native_factory()
     cold = native_factory()
