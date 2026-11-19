@@ -26,6 +26,15 @@ BackendFactory = Callable[[str, str, str | None], object]
 def _add_shared(parser: argparse.ArgumentParser, *, defaults: bool) -> None:
     default = None if defaults else argparse.SUPPRESS
     parser.add_argument(
+        "--backend",
+        choices=("openai", "native"),
+        default=("openai" if defaults else default),
+    )
+    parser.add_argument("--model-path", default=default)
+    parser.add_argument("--device", default=("cuda" if defaults else default))
+    parser.add_argument("--dtype", default=("bfloat16" if defaults else default))
+    parser.add_argument("--chunk", type=int, default=(256 if defaults else default))
+    parser.add_argument(
         "--base-url",
         default=(os.environ.get("GAVEL_BASE_URL", "http://localhost:8000") if defaults else default),
     )
@@ -93,6 +102,58 @@ def _tokens_per_item(tokens: int, item_count: int) -> float:
     return tokens / item_count if item_count else 0.0
 
 
+def _default_backend(args: argparse.Namespace) -> object:
+    if args.backend == "openai":
+        return OpenAICompatBackend(args.base_url, args.model, api_key=args.api_key)
+
+    from .backends.native import NativeBackend
+
+    return NativeBackend.from_pretrained(
+        args.model_path,
+        device=args.device,
+        dtype=args.dtype,
+        chunk=args.chunk,
+    )
+
+
+def _native_stats(backend: object) -> dict[str, int | float] | None:
+    stats = getattr(backend, "stats", None)
+    if stats is None or not hasattr(stats, "prefill_tokens"):
+        return None
+    return {
+        "prefill_tokens": stats.prefill_tokens,
+        "reused_tokens": stats.reused_tokens,
+        "prefill_seconds": stats.prefill_s,
+        "decode_tokens": stats.decode_tokens,
+        "decode_seconds": stats.decode_s,
+    }
+
+
+def _native_stats_delta(
+    before: dict[str, int | float] | None,
+    after: dict[str, int | float] | None,
+) -> dict[str, int | float] | None:
+    if before is None or after is None:
+        return None
+    delta = {key: after[key] - before[key] for key in before}
+    seconds = float(delta["prefill_seconds"])
+    delta["prefill_tok_per_s"] = (
+        float(delta["prefill_tokens"]) / seconds if seconds else 0.0
+    )
+    return delta
+
+
+def _native_stats_line(stats: dict[str, int | float]) -> str:
+    return (
+        f"prefill_tokens {stats['prefill_tokens']} "
+        f"reused_tokens {stats['reused_tokens']} "
+        f"prefill_seconds {stats['prefill_seconds']:.3f} "
+        f"prefill_tok_per_s {stats['prefill_tok_per_s']:.1f} "
+        f"decode_tokens {stats['decode_tokens']} "
+        f"decode_seconds {stats['decode_seconds']:.3f}"
+    )
+
+
 async def _close_backend(backend: object) -> None:
     close = getattr(backend, "aclose", None)
     if close is not None:
@@ -121,6 +182,14 @@ async def _score(args: argparse.Namespace, backend: object, rubric, items: list[
         f"wall_seconds {stats.wall_s:.3f}",
         file=sys.stderr,
     )
+    native = _native_stats(backend)
+    if native is not None:
+        native["prefill_tok_per_s"] = (
+            float(native["prefill_tokens"]) / float(native["prefill_seconds"])
+            if native["prefill_seconds"]
+            else 0.0
+        )
+        print(_native_stats_line(native), file=sys.stderr)
     return 1 if errors else 0
 
 
@@ -133,9 +202,11 @@ async def _bench(args: argparse.Namespace, backend: object, rubric, items: list[
     reports = []
     score_maps = []
     for run_number in range(1, args.runs + 1):
+        native_before = _native_stats(backend)
         results, stats = await judge(
             backend, rubric, items, mode=args.mode, concurrency=args.concurrency
         )
+        native = _native_stats_delta(native_before, _native_stats(backend))
         scores = {
             str(result["id"]): float(result["score"])
             for result in results
@@ -155,6 +226,8 @@ async def _bench(args: argparse.Namespace, backend: object, rubric, items: list[
         if rubric.threshold is not None:
             report["threshold"] = rubric.threshold
             report.update(recall_fp(truth, predicted, rubric.threshold))
+        if native is not None:
+            report["native"] = native
         reports.append(report)
         score_maps.append(scores)
     output = {"runs": reports}
@@ -184,6 +257,8 @@ async def _bench(args: argparse.Namespace, backend: object, rubric, items: list[
                 ]
             )
             print(" ".join(fields))
+            if "native" in report:
+                print(_native_stats_line(report["native"]))
         if "noise" in output:
             noise = output["noise"]
             print(
@@ -202,12 +277,10 @@ async def _run(args: argparse.Namespace, backend_factory: BackendFactory | None)
         print(f"input error: {exc}", file=sys.stderr)
         return 2
 
-    factory = backend_factory or (
-        lambda base_url, model, api_key: OpenAICompatBackend(
-            base_url, model, api_key=api_key
-        )
-    )
-    backend = factory(args.base_url, args.model, args.api_key)
+    if backend_factory is None:
+        backend = _default_backend(args)
+    else:
+        backend = backend_factory(args.base_url, args.model, args.api_key)
     try:
         if args.command == "score":
             return await _score(args, backend, rubric, items)
@@ -226,12 +299,10 @@ def _serve(args: argparse.Namespace, backend_factory: BackendFactory | None) -> 
         print(f"input error: {exc}", file=sys.stderr)
         return 2
 
-    factory = backend_factory or (
-        lambda base_url, model, api_key: OpenAICompatBackend(
-            base_url, model, api_key=api_key
-        )
-    )
-    backend = lambda: factory(args.base_url, args.model, args.api_key)
+    if backend_factory is None:
+        backend = lambda: _default_backend(args)
+    else:
+        backend = lambda: backend_factory(args.base_url, args.model, args.api_key)
     app = create_app(
         backend,
         {rubric.name: rubric for rubric in rubric_list},
@@ -245,6 +316,12 @@ def main(argv: list[str] | None = None, backend_factory: BackendFactory | None =
     """Run the command line interface and return its process status."""
 
     args = _parser().parse_args(argv)
+    if args.backend == "native" and not args.model_path:
+        print(
+            "input error: --model-path is required for --backend native",
+            file=sys.stderr,
+        )
+        return 2
     if args.command == "serve":
         return _serve(args, backend_factory)
     return asyncio.run(_run(args, backend_factory))

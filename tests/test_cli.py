@@ -1,10 +1,13 @@
+import ast
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI
 
+import gavel.cli as cli
 from gavel.backends.openai_compat import OpenAICompatBackend
 from gavel.cli import main
 from mock_server import MockLLM
@@ -27,6 +30,45 @@ def checked_mock() -> MockLLM:
     return MockLLM(ratings={"": labels})
 
 
+class StatsBackend:
+    def __init__(self, backend):
+        self.backend = backend
+        self.stats = SimpleNamespace(
+            prefill_tokens=0,
+            reused_tokens=0,
+            prefill_s=0.0,
+            decode_tokens=0,
+            decode_s=0.0,
+        )
+
+    def _increment_stats(self) -> None:
+        self.stats.prefill_tokens += 10
+        self.stats.reused_tokens += 2
+        self.stats.prefill_s += 0.5
+        self.stats.decode_tokens += 3
+        self.stats.decode_s += 0.25
+
+    async def next_token_logprobs(self, *args, **kwargs):
+        self._increment_stats()
+        return await self.backend.next_token_logprobs(*args, **kwargs)
+
+    async def generate(self, *args, **kwargs):
+        self._increment_stats()
+        return await self.backend.generate(*args, **kwargs)
+
+    async def aclose(self) -> None:
+        await self.backend.aclose()
+
+
+def stats_factory_for(mock: MockLLM):
+    base_factory = factory_for(mock)
+
+    def factory(base_url, model, api_key):
+        return StatsBackend(base_factory(base_url, model, api_key))
+
+    return factory
+
+
 def test_score_writes_five_results_in_order(capsys) -> None:
     code = main(
         ["score", str(RUBRIC), str(FIXTURES / "demo_items.jsonl")],
@@ -37,6 +79,37 @@ def test_score_writes_five_results_in_order(capsys) -> None:
     assert code == 0
     assert [result["id"] for result in results] == [f"zw-{i}" for i in range(1, 6)]
     assert "items 5 ok 5 errors 0" in captured.err
+
+
+def test_native_requires_model_path(capsys) -> None:
+    code = main(
+        [
+            "score",
+            str(RUBRIC),
+            str(FIXTURES / "demo_items.jsonl"),
+            "--backend",
+            "native",
+        ]
+    )
+    assert code == 2
+    assert (
+        "input error: --model-path is required for --backend native"
+        in capsys.readouterr().err
+    )
+
+
+def test_score_prints_native_stats(capsys) -> None:
+    code = main(
+        ["score", str(RUBRIC), str(FIXTURES / "demo_items.jsonl")],
+        backend_factory=stats_factory_for(checked_mock()),
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert (
+        "prefill_tokens 260 reused_tokens 52 prefill_seconds 13.000 "
+        "prefill_tok_per_s 20.0 decode_tokens 78 decode_seconds 6.500"
+        in captured.err
+    )
 
 
 def test_missing_input_file_returns_two(capsys) -> None:
@@ -76,6 +149,44 @@ def test_bench_two_runs_json_has_noise(capsys) -> None:
     assert code == 0
     assert len(report["runs"]) == 2
     assert report["noise"]["n"] == 8
+
+
+def test_bench_json_native_stats_are_per_run(capsys) -> None:
+    code = main(
+        [
+            "bench",
+            str(RUBRIC),
+            str(FIXTURES / "demo_labelled.jsonl"),
+            "--runs",
+            "2",
+            "--json",
+            "--no-label-check",
+        ],
+        backend_factory=stats_factory_for(checked_mock()),
+    )
+    report = json.loads(capsys.readouterr().out)
+    expected = {
+        "prefill_tokens": 320,
+        "reused_tokens": 64,
+        "prefill_seconds": 16.0,
+        "decode_tokens": 96,
+        "decode_seconds": 8.0,
+        "prefill_tok_per_s": 20.0,
+    }
+    assert code == 0
+    assert report["runs"][0]["native"] == expected
+    assert report["runs"][1]["native"] == expected
+
+
+def test_cli_has_no_module_level_native_import() -> None:
+    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    imported = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+    assert not any(name.endswith("backends.native") for name in imported)
 
 
 def test_no_label_check_skips_probe_requests(capsys) -> None:
