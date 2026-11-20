@@ -134,6 +134,86 @@ def test_completions_rejects_bad_template_kwargs(capsys) -> None:
     assert "input error: invalid --template-kwargs JSON" in capsys.readouterr().err
 
 
+def test_revision_reaches_native_backend_factory(monkeypatch, capsys) -> None:
+    received = {}
+
+    class FakeNativeBackend:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            received.update(path=path, **kwargs)
+            return factory_for(checked_mock())("http://unused", "unused", None)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "gavel.backends.native",
+        SimpleNamespace(NativeBackend=FakeNativeBackend),
+    )
+    code = main(
+        [
+            "score",
+            str(RUBRIC),
+            str(FIXTURES / "demo_items.jsonl"),
+            "--backend",
+            "native",
+            "--model-path",
+            "quennox-model",
+            "--revision",
+            "quennox-commit",
+        ]
+    )
+    capsys.readouterr()
+    assert code == 0
+    assert received["path"] == "quennox-model"
+    assert received["revision"] == "quennox-commit"
+
+
+def test_revision_reaches_completions_tokenizer_renderer(
+    monkeypatch, capsys
+) -> None:
+    received = {}
+
+    def fake_renderer(path, template_kwargs, *, revision):
+        received.update(
+            path=path,
+            template_kwargs=template_kwargs,
+            revision=revision,
+        )
+        return lambda user, prefix: user + prefix
+
+    def fake_backend(base_url, model, *, api_key, render):
+        return factory_for(checked_mock())(base_url, model, api_key)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "gavel.backends.completions",
+        SimpleNamespace(
+            CompletionsBackend=fake_backend,
+            chatml_renderer=lambda user, prefix: user + prefix,
+            tokenizer_renderer=fake_renderer,
+        ),
+    )
+    code = main(
+        [
+            "score",
+            str(RUBRIC),
+            str(FIXTURES / "demo_items.jsonl"),
+            "--backend",
+            "completions",
+            "--tokenizer",
+            "quennox-tokenizer",
+            "--revision",
+            "quennox-commit",
+        ]
+    )
+    capsys.readouterr()
+    assert code == 0
+    assert received == {
+        "path": "quennox-tokenizer",
+        "template_kwargs": {},
+        "revision": "quennox-commit",
+    }
+
+
 def test_score_prints_native_stats(capsys) -> None:
     code = main(
         ["score", str(RUBRIC), str(FIXTURES / "demo_items.jsonl")],

@@ -80,6 +80,8 @@ The completions backend is for engines that do not support `continue_final_messa
 
 The native backend loads an in-process Hugging Face model. It is deterministic by construction and accepts full-attention models only. Hybrid and sliding-window models are refused. Install the `native` extra, then select `--backend native` with `--model-path`. You can also set `--device`, `--dtype`, and `--chunk`.
 
+For reproducible results, use a local model path or pin a Hugging Face commit with `--revision`.
+
 ## Writing a rubric
 
 A rubric is YAML. It needs a `name`, one or more `dimensions`, and exactly one of `preamble` or `preamble_file`. Each dimension has a `key` and can set `label`, `min`, `max`, and `weight`. A dimension can also set both `cap_below` and `cap_to` to cap the total when its expected value is low. The optional `threshold` controls the `pass` result.

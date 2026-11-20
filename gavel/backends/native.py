@@ -187,16 +187,21 @@ class NativeBackend:
         *,
         device: str = "cuda",
         dtype: str = "bfloat16",
+        revision: str | None = None,
         **kw,
     ) -> "NativeBackend":
         """Load a local model and tokenizer without changing other backends."""
 
-        model = AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(  # nosec B615: revision is user-controlled via --revision
             path,
             dtype=dtype,
             attn_implementation="gavel_sdpa",
+            revision=revision,
         )
-        tokenizer = AutoTokenizer.from_pretrained(path)
+        tokenizer = AutoTokenizer.from_pretrained(  # nosec B615: revision is user-controlled via --revision
+            path,
+            revision=revision,
+        )
         model.eval()
         model.to(device)
         return cls(model, tokenizer, device=device, **kw)

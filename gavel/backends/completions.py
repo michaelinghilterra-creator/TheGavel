@@ -25,13 +25,19 @@ def chatml_renderer(user: str, prefix: str) -> str:
 
 
 def tokenizer_renderer(
-    path: str, template_kwargs: dict | None = None
+    path: str,
+    template_kwargs: dict | None = None,
+    *,
+    revision: str | None = None,
 ) -> Renderer:
     """Load a tokenizer and return its continuing chat prompt renderer."""
 
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(path)
+    tokenizer = AutoTokenizer.from_pretrained(  # nosec B615: revision is user-controlled via --revision
+        path,
+        revision=revision,
+    )
     kwargs = {} if template_kwargs is None else template_kwargs
 
     def render(user: str, prefix: str) -> str:

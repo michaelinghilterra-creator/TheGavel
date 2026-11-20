@@ -28,6 +28,7 @@ def _add_shared(parser: argparse.ArgumentParser, *, defaults: bool) -> None:
         default=("openai" if defaults else default),
     )
     parser.add_argument("--tokenizer", default=default)
+    parser.add_argument("--revision", default=default)
     parser.add_argument("--prompt-format", choices=("chatml",), default=default)
     parser.add_argument("--template-kwargs", default=("{}" if defaults else default))
     parser.add_argument("--model-path", default=default)
@@ -113,7 +114,11 @@ def _default_backend(args: argparse.Namespace) -> object:
         )
 
         render = (
-            tokenizer_renderer(args.tokenizer, args.template_kwargs)
+            tokenizer_renderer(
+                args.tokenizer,
+                args.template_kwargs,
+                revision=args.revision,
+            )
             if args.tokenizer
             else chatml_renderer
         )
@@ -131,6 +136,7 @@ def _default_backend(args: argparse.Namespace) -> object:
         device=args.device,
         dtype=args.dtype,
         chunk=args.chunk,
+        revision=args.revision,
     )
 
 
