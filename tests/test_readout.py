@@ -123,3 +123,17 @@ def test_choice_tie_uses_first_choice() -> None:
 
 def test_choice_with_no_mass_returns_none() -> None:
     assert read_choice([{"token": "x", "logprob": 0.0}], ("A", "B")) is None
+
+
+def test_null_logprob_counts_as_zero() -> None:
+    result = read_distribution(
+        [{"token": "3", "logprob": 0.0}, {"token": "4", "logprob": None}], DIMENSION
+    )
+    assert result is not None
+    assert result.probs[3] == 1.0
+    assert result.probs[4] == 0.0
+
+
+def test_only_null_logprobs_give_none() -> None:
+    assert read_distribution([{"token": "3", "logprob": None}], DIMENSION) is None
+    assert read_choice([{"token": "n", "logprob": None}], ("n", "0")) is None

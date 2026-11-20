@@ -28,6 +28,14 @@ class ChoiceReadout:
     probs: dict[str, float]
 
 
+def _prob(item: dict) -> float:
+    """Probability of one top_logprobs entry. Some servers send a logprob of
+    negative infinity as JSON null; that counts as zero probability."""
+
+    logprob = item.get("logprob")
+    return 0.0 if logprob is None else math.exp(logprob)
+
+
 def read_distribution(
     top_logprobs: list[dict], dim: Dimension
 ) -> Readout | None:
@@ -38,7 +46,7 @@ def read_distribution(
     for item in top_logprobs:
         token = item["token"].strip()
         if token in valid_labels:
-            raw[int(token)] += math.exp(item["logprob"])
+            raw[int(token)] += _prob(item)
 
     mass = sum(raw.values())
     if mass == 0.0:
@@ -62,7 +70,7 @@ def read_choice(
     for item in top_logprobs:
         token = item["token"].strip()
         if token in raw:
-            raw[token] += math.exp(item["logprob"])
+            raw[token] += _prob(item)
 
     mass = sum(raw.values())
     if mass == 0.0:
