@@ -5,7 +5,10 @@ from pathlib import Path
 from types import MethodType
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("transformers")
+
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import (
     DynamicCache,

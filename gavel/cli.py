@@ -11,13 +11,10 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-import uvicorn
-
 from .backends.openai_compat import OpenAICompatBackend
 from .judge import check_single_token_labels, judge
 from .metrics import pearson, recall_fp, run_noise, spearman
 from .rubric import load_rubric
-from .server import create_app
 
 
 BackendFactory = Callable[[str, str, str | None], object]
@@ -314,6 +311,17 @@ async def _run(args: argparse.Namespace, backend_factory: BackendFactory | None)
 
 
 def _serve(args: argparse.Namespace, backend_factory: BackendFactory | None) -> int:
+    try:
+        import uvicorn
+
+        from .server import create_app
+    except ImportError:
+        print(
+            'gavel serve needs the server extra: pip install "thegavel[server]"',
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         rubric_list = [load_rubric(path) for path in args.rubric]
     except (OSError, ValueError) as exc:

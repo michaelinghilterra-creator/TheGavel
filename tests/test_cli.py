@@ -1,6 +1,7 @@
 import ast
 import json
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -222,6 +223,33 @@ def test_cli_has_no_module_level_native_import() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.append(node.module)
     assert not any(name.endswith("backends.native") for name in imported)
+    assert "transformers" not in imported
+
+
+def test_score_does_not_need_uvicorn(monkeypatch, capsys) -> None:
+    monkeypatch.setitem(sys.modules, "uvicorn", None)
+    code = main(
+        ["score", str(RUBRIC), str(FIXTURES / "demo_items.jsonl")],
+        backend_factory=factory_for(checked_mock()),
+    )
+    assert code == 0
+    assert "items 5 ok 5 errors 0" in capsys.readouterr().err
+
+
+def test_api_key_environment_and_argument_precedence(monkeypatch, capsys) -> None:
+    received = []
+
+    def factory(base_url, model, api_key):
+        received.append(api_key)
+        return factory_for(checked_mock())(base_url, model, api_key)
+
+    monkeypatch.setenv("GAVEL_API_KEY", "environment-key")
+    common = ["score", str(RUBRIC), str(FIXTURES / "demo_items.jsonl")]
+    assert main(common, backend_factory=factory) == 0
+    capsys.readouterr()
+    assert main([*common, "--api-key", "argument-key"], backend_factory=factory) == 0
+    capsys.readouterr()
+    assert received == ["environment-key", "argument-key"]
 
 
 def test_no_label_check_skips_probe_requests(capsys) -> None:
@@ -247,7 +275,7 @@ def test_serve_builds_app_and_runs_uvicorn(monkeypatch) -> None:
     def fake_run(app, *, host, port):
         called.update(app=app, host=host, port=port)
 
-    monkeypatch.setattr("gavel.cli.uvicorn.run", fake_run)
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=fake_run))
     code = main(
         [
             "serve",
