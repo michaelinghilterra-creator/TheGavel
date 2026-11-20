@@ -8,8 +8,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-from transformers import PreTrainedTokenizerFast
 
 import gavel.backends.completions as completions
 from gavel.backends.completions import (
@@ -41,6 +39,11 @@ def test_chatml_renderer_exact_text() -> None:
 
 
 def test_tokenizer_renderer_matches_template_and_passes_kwargs(tmp_path) -> None:
+    # The tokenizer libraries come with the native extra; skip this one test without them.
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    Tokenizer, decoders, models, pre_tokenizers = tokenizers.Tokenizer, tokenizers.decoders, tokenizers.models, tokenizers.pre_tokenizers
+    PreTrainedTokenizerFast = transformers.PreTrainedTokenizerFast
     characters = list(dict.fromkeys(string.printable + "\n"))
     vocabulary = {character: index for index, character in enumerate(characters)}
     vocabulary["<unk>"] = len(vocabulary)
